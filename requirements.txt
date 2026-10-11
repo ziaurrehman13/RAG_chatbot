@@ -1,0 +1,7 @@
+pypdf # for getting the pdf
+langchain #interact with user naturally anf creates a chain of qn -->llm-->vector storage-->lang model -- output
+chromadb # Vector storage
+pytest # for unit testing
+streamlit
+langchain-community
+argparse
