@@ -5,10 +5,12 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+import fitz
 import numpy as np
+import pytesseract
 import streamlit as st
+from PIL import Image, ImageEnhance, ImageFilter
 from groq import Groq
-from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 from supabase import create_client
 
@@ -36,6 +38,10 @@ TOP_K = 4
 MEMORY_TOP_K = 5
 MEMORY_THRESHOLD = 0.25
 VECTOR_DIMENSIONS = 384
+
+# OCR settings
+OCR_MIN_TEXT_CHARS = 30
+OCR_RENDER_SCALE = 2.0
 
 
 # ============================================================
@@ -110,8 +116,6 @@ def load_saved_chats():
             "title": row.get("title") or "New chat",
             "messages": row.get("messages") or [],
             "updated_at": row.get("updated_at") or now_iso(),
-
-            # Uploaded files are session-specific.
             "upload_signature": None,
             "upload_chunks": [],
             "upload_vectors": np.empty(
@@ -156,7 +160,7 @@ def create_new_chat():
 
 
 # ============================================================
-# 4. EMBEDDING MODEL
+# 4. EMBEDDING MODEL AND GROQ
 # ============================================================
 
 @st.cache_resource
@@ -195,7 +199,7 @@ def cached_embeddings(texts):
 
 
 # ============================================================
-# 5. PDF TEXT EXTRACTION AND CHUNKING
+# 5. TEXT CHUNKING
 # ============================================================
 
 def split_text(text):
@@ -219,11 +223,112 @@ def split_text(text):
     return chunks
 
 
-def read_pdf_reader(reader, filename):
+# ============================================================
+# 6. OCR HELPERS
+# ============================================================
+
+def perform_ocr(page):
+    """
+    Render one PDF page as an image and extract its text using OCR.
+
+    Requires PyMuPDF, Pillow, pytesseract, and the Tesseract
+    OCR engine installed on the computer or hosting platform.
+    """
+
+    pixmap = page.get_pixmap(
+        matrix=fitz.Matrix(
+            OCR_RENDER_SCALE,
+            OCR_RENDER_SCALE,
+        ),
+        alpha=False,
+    )
+
+    image_bytes = pixmap.tobytes("png")
+
+    image = Image.open(
+        io.BytesIO(image_bytes)
+    ).convert("RGB")
+
+    # Basic image preprocessing to improve OCR readability.
+    image = ImageEnhance.Contrast(image).enhance(1.5)
+    image = image.filter(ImageFilter.SHARPEN)
+
+    text = pytesseract.image_to_string(
+        image,
+        config="--psm 3",
+    )
+
+    return text.strip()
+
+
+def extract_pdf_pages(pdf_bytes, filename):
+    """
+    Extract text page by page.
+
+    1. Attempt native PDF text extraction.
+    2. If a page has very little text, attempt OCR.
+    3. Preserve the original filename and page number.
+    """
+
+    extracted_pages = []
+
+    with fitz.open(
+        stream=pdf_bytes,
+        filetype="pdf",
+    ) as pdf:
+
+        for page_number, page in enumerate(pdf, start=1):
+            # First attempt normal PDF text extraction.
+            try:
+                native_text = page.get_text("text").strip()
+            except Exception as error:
+                print(
+                    f"Native extraction failed for {filename}, "
+                    f"page {page_number}: {error}"
+                )
+                native_text = ""
+
+            page_text = native_text
+            extraction_method = "native"
+
+            # Scanned/image-only pages usually have little or no
+            # extractable text, so attempt OCR on those pages.
+            if len(native_text) < OCR_MIN_TEXT_CHARS:
+                try:
+                    ocr_text = perform_ocr(page)
+
+                    # Use OCR output when it provides more text.
+                    if len(ocr_text) > len(native_text):
+                        page_text = ocr_text
+                        extraction_method = "OCR"
+
+                except Exception as error:
+                    # Keep the application running if OCR fails.
+                    print(
+                        f"OCR failed for {filename}, "
+                        f"page {page_number}: {error}"
+                    )
+
+            extracted_pages.append({
+                "source": filename,
+                "page": page_number,
+                "text": page_text,
+                "method": extraction_method,
+            })
+
+    return extracted_pages
+
+
+def pages_to_documents(extracted_pages):
+    """
+    Convert extracted page text into the existing RAG chunks.
+    Source filenames and page numbers remain attached to each chunk.
+    """
+
     documents = []
 
-    for page_number, page in enumerate(reader.pages, start=1):
-        page_text = page.extract_text() or ""
+    for item in extracted_pages:
+        page_text = item["text"]
 
         if not page_text.strip():
             continue
@@ -231,12 +336,29 @@ def read_pdf_reader(reader, filename):
         for part in split_text(page_text):
             documents.append({
                 "text": part,
-                "source": filename,
-                "page": page_number,
+                "source": item["source"],
+                "page": item["page"],
             })
 
     return documents
 
+
+def read_pdf_bytes(pdf_bytes, filename):
+    """
+    Shared PDF reader for repository PDFs and uploaded PDFs.
+    """
+
+    extracted_pages = extract_pdf_pages(
+        pdf_bytes,
+        filename,
+    )
+
+    return pages_to_documents(extracted_pages)
+
+
+# ============================================================
+# 7. PROJECT FOLDER PDF LOADING
+# ============================================================
 
 def get_folder_signature():
     # Never create directories in the deployed repository.
@@ -263,28 +385,39 @@ def load_folder_pdfs(folder_path, signature):
         pdf_path = Path(folder_path) / filename
 
         try:
-            reader = PdfReader(str(pdf_path))
+            pdf_bytes = pdf_path.read_bytes()
+
             documents.extend(
-                read_pdf_reader(reader, filename)
+                read_pdf_bytes(
+                    pdf_bytes,
+                    filename,
+                )
             )
 
         except Exception as error:
-            print(f"Could not read {filename}: {error}")
+            print(
+                f"Could not read or OCR {filename}: {error}"
+            )
 
     return documents
 
+
+# ============================================================
+# 8. UPLOADED PDF LOADING
+# ============================================================
 
 def load_uploaded_pdfs(uploaded_files):
     documents = []
 
     for uploaded_file in uploaded_files:
         try:
-            reader = PdfReader(
-                io.BytesIO(uploaded_file.getvalue())
-            )
+            pdf_bytes = uploaded_file.getvalue()
 
             documents.extend(
-                read_pdf_reader(reader, uploaded_file.name)
+                read_pdf_bytes(
+                    pdf_bytes,
+                    uploaded_file.name,
+                )
             )
 
         except Exception as error:
@@ -296,7 +429,7 @@ def load_uploaded_pdfs(uploaded_files):
 
 
 # ============================================================
-# 6. SEMANTIC CONVERSATION MEMORY
+# 9. SEMANTIC CONVERSATION MEMORY
 # ============================================================
 
 def retrieve_chat_memory(question, previous_messages):
@@ -339,7 +472,6 @@ def retrieve_chat_memory(question, previous_messages):
 
     scores = np.dot(memory_vectors, question_vector)
 
-    # Get the most similar messages.
     top_indices = np.argsort(scores)[::-1][:MEMORY_TOP_K]
 
     results = []
@@ -357,14 +489,13 @@ def retrieve_chat_memory(question, previous_messages):
                 "index": item["index"],
             })
 
-    # Keep selected memories in chronological order.
     results.sort(key=lambda item: item["index"])
 
     return results
 
 
 # ============================================================
-# 7. CONTEXTUAL QUESTION REWRITING
+# 10. CONTEXTUAL QUESTION REWRITING
 # ============================================================
 
 def contextualize_question(question, previous_messages):
@@ -423,7 +554,7 @@ def contextualize_question(question, previous_messages):
 
 
 # ============================================================
-# 8. PDF SEMANTIC RETRIEVAL
+# 11. PDF SEMANTIC RETRIEVAL
 # ============================================================
 
 def retrieve_chunks(
@@ -468,7 +599,7 @@ def retrieve_chunks(
 
 
 # ============================================================
-# 9. GENERATE ANSWER USING PDF + MEMORY
+# 12. GENERATE ANSWER USING PDF + MEMORY
 # ============================================================
 
 def generate_answer(
@@ -493,9 +624,7 @@ def generate_answer(
 
     if memory_context:
         memory_text = "\n\n".join(
-            (
-                f"{item['role']}: {item['text']}"
-            )
+            f"{item['role']}: {item['text']}"
             for item in memory_context
         )
     else:
@@ -519,7 +648,6 @@ def generate_answer(
         }
     ]
 
-    # Include recent turns to preserve conversational continuity.
     for message in previous_messages[-8:]:
         if message.get("role") in ("user", "assistant"):
             messages.append({
@@ -556,7 +684,7 @@ def generate_answer(
 
 
 # ============================================================
-# 10. RESTORE CONVERSATIONS
+# 13. RESTORE CONVERSATIONS
 # ============================================================
 
 if "chats" not in st.session_state:
@@ -594,7 +722,7 @@ if st.session_state.active_chat is None:
 
 
 # ============================================================
-# 11. SIDEBAR
+# 14. SIDEBAR
 # ============================================================
 
 with st.sidebar:
@@ -644,7 +772,7 @@ with st.sidebar:
 
 
 # ============================================================
-# 12. MAIN APPLICATION
+# 15. MAIN APPLICATION
 # ============================================================
 
 st.title("📚 Personal PDF RAG Chatbot")
@@ -662,7 +790,7 @@ chat = st.session_state.chats[
 # Load PDFs stored in the repository's data/ folder.
 folder_signature = get_folder_signature()
 
-with st.spinner("Loading project PDFs..."):
+with st.spinner("Loading project PDFs and extracting text..."):
     folder_chunks = load_folder_pdfs(
         str(DATA_DIR),
         folder_signature,
@@ -691,7 +819,7 @@ with st.expander("📁 Project folder documents"):
 
 
 # ============================================================
-# 13. UPLOAD ADDITIONAL PDFS
+# 16. UPLOAD ADDITIONAL PDFS
 # ============================================================
 
 uploaded_files = st.file_uploader(
@@ -712,7 +840,9 @@ upload_signature = tuple(
 
 
 if chat["upload_signature"] != upload_signature:
-    with st.spinner("Processing uploaded PDFs..."):
+    with st.spinner(
+        "Processing PDFs: extracting text and running OCR if needed..."
+    ):
         chat["upload_signature"] = upload_signature
 
         chat["upload_chunks"] = load_uploaded_pdfs(
@@ -735,7 +865,7 @@ if uploaded_files:
 
 
 # ============================================================
-# 14. DISPLAY CONVERSATION
+# 17. DISPLAY CONVERSATION
 # ============================================================
 
 for message in chat["messages"]:
@@ -749,7 +879,7 @@ for message in chat["messages"]:
 
 
 # ============================================================
-# 15. PROCESS CURRENT QUESTION
+# 18. PROCESS CURRENT QUESTION
 # ============================================================
 
 question = st.chat_input("Ask a question about your PDFs...")
