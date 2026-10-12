@@ -5,3 +5,6 @@ pypdf
 sentence-transformers
 numpy
 supabase
+pymupdf
+pytesseract
+Pillow
