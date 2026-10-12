@@ -33,7 +33,7 @@ LLM_MODEL = "openai/gpt-oss-20b"
 
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 150
-TOP_K = 4
+TOP_K = 8
 
 MEMORY_TOP_K = 5
 MEMORY_THRESHOLD = 0.25
@@ -643,7 +643,22 @@ def generate_answer(
                 "verified PDF evidence. Do not invent facts. "
                 "If the answer is not supported by the PDFs, "
                 "clearly say so. When possible, cite the PDF "
-                "filename and page number. Be concise and helpful."
+                "filename and page number. "
+
+                "Provide complete, detailed, step-by-step answers "
+                "when the question requires them. Do not skip steps, "
+                "important details, examples, prerequisites, warnings, "
+                "or the final conclusion. "
+
+                "For procedural questions, explain every step in the "
+                "correct order. For technical questions, include the "
+                "necessary commands, code, configuration, and explanations "
+                "when supported by the retrieved PDF passages. "
+
+                "Do not stop after giving only the first few steps. "
+                "Complete the answer before finishing. If the PDFs do not "
+                "contain enough information, clearly identify the missing "
+                "information instead of inventing it."
             ),
         }
     ]
@@ -674,7 +689,7 @@ def generate_answer(
         model=LLM_MODEL,
         messages=messages,
         temperature=0.2,
-        max_tokens=800,
+        max_tokens=4000,
     )
 
     return (
